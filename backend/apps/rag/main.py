@@ -13,8 +13,8 @@ import os, shutil
 from pathlib import Path
 from typing import List
 
-from sentence_transformers import SentenceTransformer
-from chromadb.utils import embedding_functions
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores.chroma import Chroma
 
 from langchain_community.document_loaders import (
     WebBaseLoader,
@@ -23,7 +23,6 @@ from langchain_community.document_loaders import (
     CSVLoader,
     Docx2txtLoader,
     UnstructuredEPubLoader,
-    UnstructuredWordDocumentLoader,
     UnstructuredMarkdownLoader,
     UnstructuredXMLLoader,
     UnstructuredRSTLoader,
@@ -38,13 +37,7 @@ import uuid
 import json
 
 
-from apps.web.models.documents import (
-    Documents,
-    DocumentForm,
-    DocumentResponse,
-)
-
-from apps.rag.utils import query_doc, query_collection
+from apps.web.models.documents import Documents, DocumentForm
 
 from utils.misc import (
     calculate_sha256,
@@ -57,23 +50,14 @@ from config import (
     UPLOAD_DIR,
     DOCS_DIR,
     RAG_EMBEDDING_MODEL,
-    RAG_EMBEDDING_MODEL_DEVICE_TYPE,
     CHROMA_CLIENT,
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     RAG_TEMPLATE,
+    OLLAMA_API_BASE_URL,
 )
 
 from constants import ERROR_MESSAGES
-
-#
-# if RAG_EMBEDDING_MODEL:
-#    sentence_transformer_ef = SentenceTransformer(
-#        model_name_or_path=RAG_EMBEDDING_MODEL,
-#        cache_folder=RAG_EMBEDDING_MODEL_DIR,
-#        device=RAG_EMBEDDING_MODEL_DEVICE_TYPE,
-#    )
-
 
 app = FastAPI()
 
@@ -84,13 +68,9 @@ app.state.RAG_TEMPLATE = RAG_TEMPLATE
 app.state.RAG_EMBEDDING_MODEL = RAG_EMBEDDING_MODEL
 app.state.TOP_K = 4
 
-app.state.sentence_transformer_ef = (
-    embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=app.state.RAG_EMBEDDING_MODEL,
-        device=RAG_EMBEDDING_MODEL_DEVICE_TYPE,
-    )
+app.state.sentence_transformer_ef = OllamaEmbeddings(
+    base_url=OLLAMA_API_BASE_URL.replace("/api", ""), model=RAG_EMBEDDING_MODEL
 )
-
 
 origins = ["*"]
 
@@ -127,14 +107,14 @@ def store_data_in_vector_db(data, collection_name, overwrite: bool = False) -> b
                     print(f"deleting existing collection {collection_name}")
                     CHROMA_CLIENT.delete_collection(name=collection_name)
 
-        collection = CHROMA_CLIENT.create_collection(
-            name=collection_name,
+        db = Chroma(
+            collection_name=collection_name,
             embedding_function=app.state.sentence_transformer_ef,
+            client=CHROMA_CLIENT
         )
 
-        collection.add(
-            documents=texts, metadatas=metadatas, ids=[str(uuid.uuid1()) for _ in texts]
-        )
+        db.add_texts(texts=texts, metadatas=metadatas, ids=[str(uuid.uuid1()) for _ in texts])
+
         return True
     except Exception as e:
         print(e)
@@ -172,11 +152,9 @@ async def update_embedding_model(
     form_data: EmbeddingModelUpdateForm, user=Depends(get_admin_user)
 ):
     app.state.RAG_EMBEDDING_MODEL = form_data.embedding_model
-    app.state.sentence_transformer_ef = (
-        embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=app.state.RAG_EMBEDDING_MODEL,
-            device=RAG_EMBEDDING_MODEL_DEVICE_TYPE,
-        )
+    app.state.sentence_transformer_ef = OllamaEmbeddings(
+        base_url=OLLAMA_API_BASE_URL.replace("/api", ""),
+        model=RAG_EMBEDDING_MODEL.removeprefix("ollama/")
     )
 
     return {
@@ -267,12 +245,19 @@ def query_doc_handler(
 ):
 
     try:
-        return query_doc(
+        # if you use docker use the model from the environment variable
+        db = Chroma(
             collection_name=form_data.collection_name,
-            query=form_data.query,
-            k=form_data.k if form_data.k else app.state.TOP_K,
             embedding_function=app.state.sentence_transformer_ef,
+            client=CHROMA_CLIENT
         )
+        result = db.similarity_search(
+            form_data.query, form_data.k if form_data.k else app.state.TOP_K
+        )
+        return {
+            "documents": [doc.page_content for doc in result],
+            "metadatas": [doc.metadata["source"] for doc in result if "source" in doc.metadata],
+        }
     except Exception as e:
         print(e)
         raise HTTPException(
@@ -292,12 +277,21 @@ def query_collection_handler(
     form_data: QueryCollectionsForm,
     user=Depends(get_current_user),
 ):
-    return query_collection(
-        collection_names=form_data.collection_names,
-        query=form_data.query,
-        k=form_data.k if form_data.k else app.state.TOP_K,
-        embedding_function=app.state.sentence_transformer_ef,
-    )
+    results = []
+
+    for collection_name in form_data.collection_names:
+        try:
+            # if you use docker use the model from the environment variable
+            db = Chroma(
+                collection_name=collection_name,
+                embedding_function=app.state.sentence_transformer_ef,
+                client=CHROMA_CLIENT
+            )
+            results += db.similarity_search(
+                form_data.query, form_data.k if form_data.k else app.state.TOP_K
+            )
+        except:
+            pass
 
 
 @app.post("/web")
